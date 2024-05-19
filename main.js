@@ -1,6 +1,7 @@
-import redCom from "./reduce.wgsl.js";
+const MaxWorkGroupSize = 256;
 const adapter = await navigator.gpu?.requestAdapter();
 const device = await adapter?.requestDevice();
+
 if (!device) {
   fail("need a browser that supports WebGPU");
 }
@@ -8,35 +9,13 @@ const module = device.createShaderModule({
   label: "reducer",
   code: `
   @group(0) @binding(0) var<storage,read> inputBuffer: array<u32>;
-  @group(0) @binding(1) var<storage,read_write> output: atomic<u32>;
+  // @group(0) @binding(1) var<storage,read_write> output: atomic<u32>;
+  @group(0) @binding(2) var<storage,read_write> debugBuffer: atomic<u32>;
   
-  // Create zero-initialized workgroup shared data
-  const wgsize : u32 = 256;
-  var<workgroup> sdata: array<u32, wgsize>;
-  
-  @compute @workgroup_size(256)
-  fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_id) local_id: vec3<u32>) {
-  
-      // Each thread should read its data:
-      var tid: u32 = local_id.x;
-      sdata[tid] = select(0, inputBuffer[id.x], id.x < 4194304);
-  
-      // sync all the threads:
-      workgroupBarrier();
-  
-      // Do the reduction in shared memory: reduction
-      for (var s: u32 = 1; s < wgsize; s *= 2) {
-          if tid % (2 * s) == 0 {
-              sdata[tid] += sdata[tid + s];
-          }
-  
-          workgroupBarrier();
-      }
-  
-      // Add result from the workgroup to the output storage:
-      if tid == 0 {
-          atomicAdd(&output, sdata[0]);
-      }
+  @compute @workgroup_size(64)
+  fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+      // Accumulate in buffer:
+      atomicAdd(&debugBuffer, inputBuffer[id.x]);
   }`,
 });
 
@@ -47,22 +26,48 @@ const pipeline = device.createComputePipeline({
     module,
   },
 });
-
+const pipeline1 = device.createComputePipeline({
+  label: "sum",
+  layout: "auto",
+  compute: {
+    module,
+  },
+});
 const outputSize = 4;
 const outputStorageBuffer = device.createBuffer({
-  label: "storage",
+  label: "outputStorageBuffer",
   size: outputSize,
-  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  usage:
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
 });
-// const outputValues = new Int32Array(1);
+const outputValues = new Int32Array(1);
+device.queue.writeBuffer(outputStorageBuffer, 0, outputValues);
 
-const sumValues = new Int32Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+const radomValues = [];
+for (let i = 0; i < 1000000; i++) {
+  radomValues[i] = Math.floor(Math.random() * 1000);
+}
+
+const sumValues = new Int32Array(radomValues);
+
 const sumValuesBuffer = device.createBuffer({
   label: "sum values",
   size: sumValues.length * 4,
   usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
 });
 device.queue.writeBuffer(sumValuesBuffer, 0, sumValues);
+
+const debugBuffer = device.createBuffer({
+  label: "debugBuffer",
+  size: 4,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+});
+
+const resBuffer = device.createBuffer({
+  label: "resBuffer",
+  size: debugBuffer.size,
+  usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+});
 
 const bindGroup = device.createBindGroup({
   label: "sum bind group",
@@ -74,10 +79,16 @@ const bindGroup = device.createBindGroup({
         buffer: sumValuesBuffer,
       },
     },
+    // {
+    //   binding: 1,
+    //   resource: {
+    //     buffer: outputStorageBuffer,
+    //   },
+    // },
     {
-      binding: 1,
+      binding: 2,
       resource: {
-        buffer: outputStorageBuffer,
+        buffer: debugBuffer,
       },
     },
   ],
@@ -89,5 +100,39 @@ const computePass = encoder.beginComputePass();
 computePass.setBindGroup(0, bindGroup);
 computePass.setPipeline(pipeline);
 
-computePass.dispatchWorkgroups(16, 1);
+computePass.dispatchWorkgroups(
+  Math.ceil(sumValuesBuffer.size / MaxWorkGroupSize),
+  1
+);
 computePass.end();
+
+encoder.copyBufferToBuffer(debugBuffer, 0, resBuffer, 0, debugBuffer.size);
+
+console.time("gpu1 begin execution");
+device.queue.submit([encoder.finish()]);
+
+let sum = 0;
+console.time("cpu begin execution");
+radomValues.forEach((r) => {
+  sum += r;
+});
+
+console.log(sum);
+console.timeEnd("cpu begin execution");
+
+// Finally, map and read from the CPU-readable buffer.
+resBuffer
+  .mapAsync(
+    GPUMapMode.READ,
+    0, // Offset
+    debugBuffer.length // Length
+  )
+  .then(() => {
+    //resolves the Promise created by the call to mapAsync()
+    const copyArrayBuffer = resBuffer.getMappedRange(0, debugBuffer.length);
+    const data = copyArrayBuffer.slice();
+    resBuffer.unmap();
+
+    console.log(new Int32Array(data)[0]); //display the information.
+    console.timeEnd("gpu1 begin execution");
+  });
